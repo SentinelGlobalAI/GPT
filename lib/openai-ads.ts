@@ -1,111 +1,69 @@
 import "server-only";
 
-import { createHash } from "node:crypto";
+export const supportedConversionTypes = ["lead_created", "appointment_scheduled"] as const;
+export type ConversionType = (typeof supportedConversionTypes)[number];
 
-export type OpenAIAdsEventType = "lead_created" | "appointment_scheduled";
-
-type ConversionInput = {
-  eventId: string;
-  type: OpenAIAdsEventType;
+export type ConversionInput = {
+  id: string;
+  type: ConversionType;
+  timestampMs: number;
   sourceUrl: string;
   oppref?: string;
-  email?: string;
+  emailSha256?: string;
+  externalIdSha256?: string;
   ipAddress?: string;
   userAgent?: string;
-  optedOut?: boolean;
+  optOut?: boolean;
 };
 
-function sha256(value: string) {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-export function normalizeEmail(email: string) {
-  return email.trim().toLowerCase();
-}
-
-export function sanitizeSourceUrl(
-  candidate: string | undefined,
-  requestOrigin: string,
-  pathname: string
-) {
+export function sanitizeSourceUrl(candidate: string) {
   const configuredOrigin = process.env.OPENAI_ADS_SITE_ORIGIN;
-  const trustedOrigins = new Set<string>();
+  if (!configuredOrigin) throw new Error("OPENAI_ADS_SITE_ORIGIN is not configured");
 
-  for (const origin of [configuredOrigin, requestOrigin]) {
-    if (!origin) continue;
-    try {
-      const parsed = new URL(origin);
-      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-        trustedOrigins.add(parsed.origin);
-      }
-    } catch {
-      // Invalid origins are ignored and never used as trust anchors.
-    }
+  const trusted = new URL(configuredOrigin);
+  const parsed = new URL(candidate);
+  if (!["http:", "https:"].includes(trusted.protocol) || !["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Only HTTP(S) source URLs are allowed");
   }
+  if (parsed.origin !== trusted.origin) throw new Error("Untrusted source URL origin");
 
-  if (candidate) {
-    try {
-      const parsed = new URL(candidate);
-      if (
-        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
-        trustedOrigins.has(parsed.origin)
-      ) {
-        return `${parsed.origin}${parsed.pathname}`;
-      }
-    } catch {
-      // Fall through to the canonical origin.
-    }
-  }
-
-  const fallbackOrigin = configuredOrigin ?? requestOrigin;
-  const parsedFallback = new URL(fallbackOrigin);
-  if (parsedFallback.protocol !== "http:" && parsedFallback.protocol !== "https:") {
-    throw new Error("OpenAI Ads site origin must use HTTP(S)");
-  }
-
-  return `${parsedFallback.origin}${pathname.startsWith("/") ? pathname : `/${pathname}`}`;
+  return `${parsed.origin}${parsed.pathname}`;
 }
 
 export async function sendOpenAIAdsConversion(input: ConversionInput) {
-  try {
-    const pixelId = process.env.OPENAI_ADS_PIXEL_ID;
-    const apiKey = process.env.OPENAI_ADS_CONVERSIONS_API_KEY;
-    if (!pixelId || !apiKey) return;
+  const pixelId = process.env.OPENAI_ADS_PIXEL_ID;
+  const apiKey = process.env.OPENAI_ADS_CONVERSIONS_API_KEY;
+  if (!pixelId || !apiKey) throw new Error("OpenAI Ads is not configured");
 
-    const user: Record<string, string> = {};
-    if (input.email) user.email_sha256 = sha256(normalizeEmail(input.email));
-    if (input.ipAddress) user.ip_address = input.ipAddress;
-    if (input.userAgent) user.user_agent = input.userAgent;
+  const user: Record<string, string> = {};
+  if (input.emailSha256) user.email_sha256 = input.emailSha256;
+  if (input.externalIdSha256) user.external_id_sha256 = input.externalIdSha256;
+  if (input.ipAddress) user.ip_address = input.ipAddress;
+  if (input.userAgent) user.user_agent = input.userAgent;
 
-    const event: Record<string, unknown> = {
-      id: input.eventId,
-      type: input.type,
-      timestamp_ms: Date.now(),
-      action_source: "web",
-      source_url: input.sourceUrl,
-      data: { type: "customer_action" }
-    };
+  const event: Record<string, unknown> = {
+    id: input.id,
+    type: input.type,
+    timestamp_ms: input.timestampMs,
+    action_source: "web",
+    source_url: sanitizeSourceUrl(input.sourceUrl),
+    data: { type: "customer_action" }
+  };
 
-    if (input.oppref) event.oppref = input.oppref;
-    if (Object.keys(user).length > 0) event.user = user;
-    if (input.optedOut) event.opt_out = true;
+  if (input.oppref) event.oppref = input.oppref;
+  if (Object.keys(user).length > 0) event.user = user;
+  if (input.optOut) event.opt_out = true;
 
-    await fetch(
-      `https://bzr.openai.com/v1/events?pid=${encodeURIComponent(pixelId)}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          validate_only: process.env.OPENAI_ADS_VALIDATE_ONLY === "true",
-          events: [event]
-        }),
-        signal: AbortSignal.timeout(1500)
-      }
-    );
-  } catch {
-    // Measurement is best-effort and must never fail the lead flow.
-  }
+  const response = await fetch(`https://bzr.openai.com/v1/events?pid=${encodeURIComponent(pixelId)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      validate_only: process.env.OPENAI_ADS_VALIDATE_ONLY === "true",
+      events: [event]
+    }),
+    signal: AbortSignal.timeout(2000),
+    cache: "no-store"
+  });
+
+  if (!response.ok) throw new Error(`OpenAI Ads rejected conversion (${response.status})`);
 }
